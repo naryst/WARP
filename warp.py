@@ -9,6 +9,7 @@ from transformers import (
 import lovely_tensors as lt
 import torch.nn.functional as F
 from copy import deepcopy
+from merging import models_interpolate, slerp_models
 
 
 lt.monkey_patch()
@@ -48,11 +49,14 @@ def weights_check(model1, model2):
     print("Reference model successfully created and verified.")
 
 
-reward_model_checkpoint = "reward_model/final_checkpoint"
-reward_model = AutoModelForSequenceClassification.from_pretrained(
-    reward_model_checkpoint, ignore_mismatched_sizes=True, num_labels=1
-).to(device)
-reward_model_tokenizer = AutoTokenizer.from_pretrained(reward_model_checkpoint)
+# create Adam optimizer with a given model params
+def opt(model, lr=1e-6):
+    return torch.optim.AdamW(model.parameters(), lr=lr)
+
+
+def get_random_prompts(dataset, batch_size):
+    r = torch.randint(low=0, high=len(dataset), size=(batch_size,))
+    return dataset[r]
 
 
 def get_score(model, tokenizer, response_text):
@@ -120,9 +124,11 @@ def model_forward(
 
 
 def policy_gradient(
+    reward_model,
     model,
     ref_model,
     tokenizer,
+    reward_model_tokenizer,
     prompt,  # B x L x |V| (B - batchsize, L - prompt len, |V| - vocab size)
     optimizer,
     beta,
@@ -180,113 +186,12 @@ def policy_gradient(
     return reward, kl, loss
 
 
-def scale_model_weights(model, scaling_factor):
-    scaled_model = deepcopy(model)
-    with torch.no_grad():
-        for param in scaled_model.parameters():
-            param *= scaling_factor
-    return scaled_model
-
-
-def sum_model_weights(model1, model2):
-    scaled_model = deepcopy(model1)
-    with torch.no_grad():
-        for param1, param2 in zip(scaled_model.parameters(), model2.parameters()):
-            param1 += param2
-    return scaled_model
-
-
-def models_interpolate(model, additional_model, mu):
-    scaled_model = scale_model_weights(model, mu)
-    scaled_model_ema = scale_model_weights(additional_model, (1 - mu))
-    return sum_model_weights(scaled_model, scaled_model_ema)
-
-
-def lerp(t: float, v0: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:
-    return (1 - t) * v0 + t * v1
-
-
-def normalize(v: torch.Tensor, eps: float):
-    norm_v = torch.linalg.norm(v)
-    if norm_v > eps:
-        v = v / norm_v
-    return v
-
-
-def slerp(
-    t: float,
-    v0: torch.Tensor,
-    v1: torch.Tensor,
-    DOT_THRESHOLD: float = 0.9995,
-    eps: float = 1e-8,
-):
-    """
-    Spherical linear interpolation
-
-    From: https://gist.github.com/dvschultz/3af50c40df002da3b751efab1daddf2c
-    Args:
-        t: Float value between 0.0 and 1.0
-        v0: Starting layer weights
-        v1: Final layer weights
-        DOT_THRESHOLD (float): Threshold for considering the two vectors as
-                               colinear. Not recommended to alter this.
-    Returns:
-        v2: Interpolation vector between v0 and v1
-    """
-    # Copy the vectors to reuse them later
-    v0_copy = v0.detach().clone()
-    v1_copy = v1.detach().clone()
-
-    # Normalize the vectors to get the directions and angles
-    v0 = normalize(v0, eps)
-    v1 = normalize(v1, eps)
-
-    # Dot product with the normalized vectors (can't use np.dot in W)
-    dot = torch.sum(v0 * v1)
-
-    # If absolute value of dot product is almost 1, vectors are ~colinear, so use lerp
-    if torch.abs(dot) > DOT_THRESHOLD:
-        res = lerp(t, v0_copy, v1_copy)
-        return res
-
-    # Calculate initial angle between v0 and v1
-    theta_0 = torch.arccos(dot)
-    sin_theta_0 = torch.sin(theta_0)
-
-    # Angle at timestep t
-    theta_t = theta_0 * t
-    sin_theta_t = torch.sin(theta_t)
-
-    # Finish the slerp algorithm
-    s0 = torch.sin(theta_0 - theta_t) / sin_theta_0
-    s1 = sin_theta_t / sin_theta_0
-    res = s0 * v0_copy + s1 * v1_copy
-
-    return res
-
-
-def slerp_models(model1, model2, Lambda=0.5):
-    for param1, param2 in zip(model1.parameters(), model2.parameters()):
-        param1 = slerp(Lambda, param1, param2)
-    return model1
-
-
-# create Adam optimizer with a given model params
-def opt(model, lr=1e-6):
-    return torch.optim.AdamW(model.parameters(), lr=lr)
-
-
-def get_random_prompts(dataset, batch_size):
-    r = torch.randint(low=0, high=len(dataset), size=(batch_size,))
-    return dataset[r]
-
-
 def warp(
     model_init,
     ref_model,
     tokenizer,
     reward_model,
-    reward_tokenizer,
+    reward_model_tokenizer,
     X,
     opt,
     I,
@@ -306,7 +211,14 @@ def warp(
                 optimizer = opt(model_m)
                 prompt = get_random_prompts(X, batch_size)
                 reward, kl, loss = policy_gradient(
-                    model_m, ref_model, tokenizer, prompt, optimizer, beta
+                    reward_model,
+                    model_m,
+                    ref_model,
+                    tokenizer,
+                    reward_model_tokenizer,
+                    prompt,
+                    optimizer,
+                    beta,
                 )
                 print("STEP:", t)
                 print(
@@ -338,6 +250,12 @@ def main():
     model.generation_config = generation_config
     ref_model = AutoModelForCausalLM.from_pretrained(model_checkpoint).to(device)
     prompts_ids = prompts["prompt_input_ids"].to(device)
+
+    reward_model_checkpoint = "reward_model/final_checkpoint"
+    reward_model = AutoModelForSequenceClassification.from_pretrained(
+        reward_model_checkpoint, ignore_mismatched_sizes=True, num_labels=1
+    ).to(device)
+    reward_model_tokenizer = AutoTokenizer.from_pretrained(reward_model_checkpoint)
     warp(
         model,
         ref_model,

@@ -1,3 +1,5 @@
 comment_pairs
 prompts_dataset_tokenized
 reward_model
+*wandb
+*__pycache__
