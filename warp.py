@@ -15,12 +15,6 @@ lt.monkey_patch()
 TEMPERATURE = 0.7
 device = torch.device("cuda")
 
-prompts = datasets.load_from_disk("prompts_dataset_tokenized")
-model_checkpoint = "lvwerra/gpt2-imdb"
-model = AutoModelForCausalLM.from_pretrained(model_checkpoint).to(device)
-tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
-tokenizer.pad_token_id = tokenizer.eos_token_id
-
 generation_config = GenerationConfig(
     bos_token_id=50256,
     eos_token_id=50256,
@@ -39,8 +33,6 @@ tokenizer_config = {
     "truncation": True,
     "return_tensors": "pt",
 }
-model.generation_config = generation_config
-ref_model = AutoModelForCausalLM.from_pretrained(model_checkpoint).to(device)
 
 
 def weights_check(model1, model2):
@@ -54,6 +46,7 @@ def weights_check(model1, model2):
         ), f"Mismatch found in {name}"
 
     print("Reference model successfully created and verified.")
+
 
 reward_model_checkpoint = "reward_model/final_checkpoint"
 reward_model = AutoModelForSequenceClassification.from_pretrained(
@@ -71,14 +64,13 @@ def get_score(model, tokenizer, response_text):
 
 
 def reward_KL_penalty(reward, beta, current_policy, anchor_policy):
-    kl = F.kl_div(
-        current_policy, anchor_policy.exp(), reduction="none", log_target=True
-    )
+    kl = current_policy - anchor_policy
     # mathematically correct reduction (https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html)
     kl = kl.sum(dim=-1) / current_policy.size(0)
     kl = kl.unsqueeze(-1)
     reward -= beta * kl
     return reward, kl
+
 
 def model_generate_output(prompt, model, tokenizer):
     if len(prompt.shape) == 1:
@@ -93,6 +85,7 @@ def model_generate_output(prompt, model, tokenizer):
     scores = torch.stack(scores, 1)
     decoded_result = tokenizer.batch_decode(generated)
     return generated, decoded_result, scores
+
 
 def model_forward(
     model: torch.nn.Module,
@@ -117,7 +110,6 @@ def model_forward(
     attention_mask = query_responses != pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    print(input_ids)
     return model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -152,36 +144,40 @@ def policy_gradient(
     ).logits
     anchor_logits = anchor_logits[:, prompt_length - 1 : -1]  # B x L_g x |V|
 
+    # get cur model logits in the same way (trying to fix KL)
+    cur_logits = model_forward(  # B x (L + L_g) x |V|
+        model, query_responses=full_text_tokens, pad_token_id=tokenizer.pad_token_id
+    ).logits
+    cur_logits = cur_logits[:, prompt_length - 1 : -1]  # B x L_g x |V|
+
+    # assert torch.equal(anchor_logits, cur_logits)
+    # weights_check(model, ref_model)
+
+    cur_logits /= TEMPERATURE
     cur_logits_dist = F.log_softmax(cur_logits, dim=-1)
     logprobs = torch.gather(cur_logits_dist, 2, generated.unsqueeze(-1)).squeeze(
         -1
     )  # B x L_g
 
-    anchor_logits /= TEMPERATURE # set the same temperature as for the generation
+    anchor_logits /= TEMPERATURE  # set the same temperature as for the generation
     anchor_logits_dist = F.log_softmax(anchor_logits, dim=-1)
     anchor_logprobs = torch.gather(
         anchor_logits_dist, 2, generated.unsqueeze(-1)
     ).squeeze(-1)  # B x L_g
 
+    # assert torch.equal(logprobs, anchor_logprobs)
+
     # ============= STEP 2 - KL PENALIZED REWARD =============
     reward = get_score(reward_model, reward_model_tokenizer, full_text)
-    reward, kl = reward_KL_penalty(reward, beta, logprobs, anchor_logprobs)
+    reward_kl_penalized, kl = reward_KL_penalty(reward, beta, logprobs, anchor_logprobs)
 
     # ============= STEP 3 - POLICY GRADIENT =============
-    cur_policy = model_forward(  # B x (L + L_g) x |V|
-        model, query_responses=full_text_tokens, pad_token_id=tokenizer.pad_token_id
-    ).logits
-    cur_policy = cur_policy[:, prompt_length - 1 : -1]  # B x L_g x |V|
-    log_cur_policy = F.log_softmax(cur_policy, dim=-1)
-    action_log_probs = torch.gather(log_cur_policy, 2, generated.unsqueeze(-1)).squeeze(
-        -1
-    )  # B x L_g
-    loss = -(reward * action_log_probs).mean()
+    loss = -(reward * logprobs).mean()
     loss.backward()
     optimizer.step()
     optimizer.zero_grad()
 
-    return reward, kl
+    return reward, kl, loss
 
 
 def scale_model_weights(model, scaling_factor):
@@ -309,11 +305,20 @@ def warp(
             for t in range(T):
                 optimizer = opt(model_m)
                 prompt = get_random_prompts(X, batch_size)
-                reward, kl = policy_gradient(
+                reward, kl, loss = policy_gradient(
                     model_m, ref_model, tokenizer, prompt, optimizer, beta
                 )
                 print("STEP:", t)
-                print("REWARD:", reward.mean().item(), "|", "KL:", kl.mean().item())
+                print(
+                    "REWARD:",
+                    reward.mean().item(),
+                    "|",
+                    "KL:",
+                    kl.mean().item(),
+                    "|",
+                    "LOSS:",
+                    loss.item(),
+                )
                 print("=" * 100)
                 model_ema_m = models_interpolate(model_ema_m, model_m, mu=mu)
             rl_runs.append(model_ema_m)
@@ -324,20 +329,32 @@ def warp(
     # return models_interpolate()
 
 
-prompts_ids = prompts["prompt_input_ids"].to(device)
-warp(
-    model,
-    ref_model,
-    tokenizer,
-    reward_model,
-    reward_model_tokenizer,
-    prompts_ids,
-    opt,
-    I=1,
-    M=2,
-    T=5000,
-    mu=0.001,
-    nu=0.3,
-    beta=0.1,
-    batch_size=16,
-)
+def main():
+    prompts = datasets.load_from_disk("prompts_dataset_tokenized")
+    model_checkpoint = "lvwerra/gpt2-imdb"
+    model = AutoModelForCausalLM.from_pretrained(model_checkpoint).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+    model.generation_config = generation_config
+    ref_model = AutoModelForCausalLM.from_pretrained(model_checkpoint).to(device)
+    prompts_ids = prompts["prompt_input_ids"].to(device)
+    warp(
+        model,
+        ref_model,
+        tokenizer,
+        reward_model,
+        reward_model_tokenizer,
+        prompts_ids,
+        opt,
+        I=1,
+        M=2,
+        T=5000,
+        mu=0.001,
+        nu=0.3,
+        beta=0.1,
+        batch_size=16,
+    )
+
+
+if __name__ == "__main__":
+    main()
