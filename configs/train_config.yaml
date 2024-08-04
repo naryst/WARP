@@ -15,6 +15,7 @@ training:
   device: "cuda"
   lr: 1e-4
   batch_size: 64
+  seed: 42
 
 warp:
   I: 2

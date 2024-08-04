@@ -16,6 +16,9 @@ from omegaconf import OmegaConf
 
 lt.monkey_patch()
 
+def set_random_seed(state):
+    torch.manual_seed(state)
+
 
 def weights_check(model1, model2):
     main_model_weights = {k: v.clone() for k, v in model1.named_parameters()}
@@ -64,7 +67,7 @@ def reward_KL_penalty(reward, beta, current_policy, anchor_policy):
     return reward, kl
 
 
-def model_generate_output(prompt, model, tokenizer):
+def model_generate_output(prompt, model, tokenizer, generation_config):
     if len(prompt.shape) == 1:
         prompt = prompt.unsqueeze(0)
     result = model.generate(
@@ -117,6 +120,7 @@ def get_policies(
     ref_model,
     tokenizer,
     prompt,  # B x L x |V| (B - batchsize, L - prompt len, |V| - vocab size)
+    generation_config,
 ):
     """
     Generate text and compute log probabilities for both the current model and a reference model.
@@ -138,10 +142,11 @@ def get_policies(
             - anchor_logprobs (torch.Tensor): Log probabilities of the generated tokens for the reference model.
             - full_text (str): The full generated text including the prompt.
     """
+    TEMPERATURE = generation_config.temperature
     # ============= STEP 1 - GET POLICIES =============
     # get generation logits for the current model
     full_text_tokens, full_text, cur_logits = model_generate_output(
-        prompt, model, tokenizer
+        prompt, model, tokenizer, generation_config
     )
     # full_text_tokens - B x (L + L_g) (L_g is num of generated tokens)
     # cur_Logits - B x L_g x |V|
@@ -189,9 +194,10 @@ def policy_gradient(
     prompt,  # B x L x |V| (B - batchsize, L - prompt len, |V| - vocab size)
     optimizer,
     beta,
+    generation_config
 ):
     logprobs, anchor_logprobs, full_text = get_policies(
-        model, ref_model, tokenizer, prompt
+        model, ref_model, tokenizer, prompt, generation_config
     )
 
     # ============= STEP 2 - KL PENALIZED REWARD =============
@@ -208,7 +214,7 @@ def policy_gradient(
 
 
 def KL_reward_paretto_front(
-    model_sft, model_slerp, batch, tokenizer, reward_model, reward_model_tokenizer
+    model_sft, model_slerp, batch, tokenizer, reward_model, reward_model_tokenizer, generation_config
 ):
     nus = [0, 0.1, 0.3, 0.5, 0.8, 1]
     points = []
@@ -220,6 +226,7 @@ def KL_reward_paretto_front(
             model_sft,
             tokenizer,
             batch,
+            generation_config
         )
         KL = get_kl(merged_policy, sft_policy).mean().item()
         reward = get_score(reward_model, reward_model_tokenizer, response).mean().item()
@@ -227,12 +234,13 @@ def KL_reward_paretto_front(
     return points
 
 
+# вынести логирование в отдельную функцию
 def warp(
     model_init, ref_model, tokenizer, reward_model, reward_model_tokenizer, X, opt, cfg
 ):
     train_rewards = []
     train_kls = []
-
+    generation_config = GenerationConfig(**cfg.generation_config)
     for i in range(cfg.warp.I):
         rl_runs = []
         for m in range(cfg.warp.M):
@@ -250,6 +258,7 @@ def warp(
                     prompt,
                     optimizer,
                     cfg.warp.beta,
+                    generation_config
                 )
                 train_rewards.append(reward.mean().item())
                 train_kls.append(kl.mean().item())
@@ -281,6 +290,7 @@ def warp(
         tokenizer,
         reward_model,
         reward_model_tokenizer,
+        generation_config
     )
 
     if cfg.wandb.track:
@@ -320,9 +330,8 @@ def warp(
 
 @hydra.main(version_base=None, config_path="configs", config_name="train_config")
 def main(cfg):
-    global TEMPERATURE, device, generation_config
-    TEMPERATURE = cfg.generation_config.temperature
     device = torch.device(cfg.training.device)
+    set_random_seed(cfg.training.seed)
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     if cfg.wandb.track:
         run = wandb.init(  # noqa: F841
