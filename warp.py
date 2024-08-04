@@ -16,6 +16,7 @@ from omegaconf import OmegaConf
 
 lt.monkey_patch()
 
+
 def set_random_seed(state):
     torch.manual_seed(state)
 
@@ -194,7 +195,7 @@ def policy_gradient(
     prompt,  # B x L x |V| (B - batchsize, L - prompt len, |V| - vocab size)
     optimizer,
     beta,
-    generation_config
+    generation_config,
 ):
     logprobs, anchor_logprobs, full_text = get_policies(
         model, ref_model, tokenizer, prompt, generation_config
@@ -214,7 +215,13 @@ def policy_gradient(
 
 
 def KL_reward_paretto_front(
-    model_sft, model_slerp, batch, tokenizer, reward_model, reward_model_tokenizer, generation_config
+    model_sft,
+    model_slerp,
+    batch,
+    tokenizer,
+    reward_model,
+    reward_model_tokenizer,
+    generation_config,
 ):
     nus = [0, 0.1, 0.3, 0.5, 0.8, 1]
     points = []
@@ -222,11 +229,7 @@ def KL_reward_paretto_front(
         sft_copy = deepcopy(model_sft)
         merged_model = models_interpolate(model_slerp, sft_copy, mu=nu)
         merged_policy, sft_policy, response = get_policies(
-            merged_model,
-            model_sft,
-            tokenizer,
-            batch,
-            generation_config
+            merged_model, model_sft, tokenizer, batch, generation_config
         )
         KL = get_kl(merged_policy, sft_policy).mean().item()
         reward = get_score(reward_model, reward_model_tokenizer, response).mean().item()
@@ -234,7 +237,49 @@ def KL_reward_paretto_front(
     return points
 
 
-# вынести логирование в отдельную функцию
+def step_log(step, reward, kl, loss, track):
+    info = {
+        "step": step,
+        "reward": reward.mean().item(),
+        "kl": kl.mean().item(),
+        "loss": loss.item(),
+    }
+    if track:
+        wandb.log(info, step=step)
+    else:
+        print(info)
+
+def final_log(points, train_kls, train_rewards):
+    wandb.log(
+        {
+            "KL_vs_Reward": wandb.plot.scatter(
+                wandb.Table(
+                    data=[[kl, reward] for kl, reward in points],
+                    columns=["KL", "Reward"],
+                ),
+                "KL",
+                "Reward",
+                title="KL-Reward Pareto Front",
+            )
+        }
+    )
+    wandb.log(
+        {
+            "train KL_vs_Reward": wandb.plot.scatter(
+                wandb.Table(
+                    data=[
+                        [kl, reward] for kl, reward in zip(train_kls, train_rewards)
+                    ],
+                    columns=["KL", "Reward"],
+                ),
+                "KL",
+                "Reward",
+                title="train KL-Reward",
+            )
+        }
+    )
+
+
 def warp(
     model_init, ref_model, tokenizer, reward_model, reward_model_tokenizer, X, opt, cfg
 ):
@@ -258,22 +303,26 @@ def warp(
                     prompt,
                     optimizer,
                     cfg.warp.beta,
-                    generation_config
+                    generation_config,
                 )
-                train_rewards.append(reward.mean().item())
-                train_kls.append(kl.mean().item())
                 step = t + (cfg.warp.T * m) + (cfg.warp.M * cfg.warp.T * i)
                 if step % cfg.wandb.log_steps == 0:
-                    info = {
-                        "step": step,
-                        "reward": reward.mean().item(),
-                        "kl": kl.mean().item(),
-                        "loss": loss.item(),
-                    }
-                    if cfg.wandb.track:
-                        wandb.log(info, step=step)
-                    else:
-                        print(info)
+                    # заново посчитать reward и  KL c базовой версией модели (а не EMA)
+                    point_reward, point_kl, point_loss = policy_gradient(
+                        reward_model,
+                        model_m,
+                        ref_model,
+                        tokenizer,
+                        reward_model_tokenizer,
+                        prompt,
+                        optimizer,
+                        cfg.warp.beta,
+                        generation_config,
+                    )
+                    step_log(step, point_reward, point_kl, point_loss, cfg.wandb.track)
+                    train_rewards.append(point_reward.mean().item())
+                    train_kls.append(point_kl.mean().item())
+
                 model_ema_m = models_interpolate(model_m, model_ema_m, mu=cfg.warp.mu)
             rl_runs.append(model_ema_m)
         assert len(rl_runs) == 2, NotImplementedError
@@ -290,39 +339,11 @@ def warp(
         tokenizer,
         reward_model,
         reward_model_tokenizer,
-        generation_config
+        generation_config,
     )
 
     if cfg.wandb.track:
-        wandb.log(
-            {
-                "KL_vs_Reward": wandb.plot.scatter(
-                    wandb.Table(
-                        data=[[kl, reward] for kl, reward in points],
-                        columns=["KL", "Reward"],
-                    ),
-                    "KL",
-                    "Reward",
-                    title="KL-Reward Pareto Front",
-                )
-            }
-        )
-
-        wandb.log(
-            {
-                "train KL_vs_Reward": wandb.plot.scatter(
-                    wandb.Table(
-                        data=[
-                            [kl, reward] for kl, reward in zip(train_kls, train_rewards)
-                        ],
-                        columns=["KL", "Reward"],
-                    ),
-                    "KL",
-                    "Reward",
-                    title="train KL-Reward",
-                )
-            }
-        )
+        final_log(points, train_kls, train_rewards)
 
     wandb.finish()
     return points, model_init
@@ -364,8 +385,8 @@ def main(cfg):
         cfg,
     )
     print(KL_reward_paretto_front)
-    trained_model.save_pretrained('trained_warp_model')
-    tokenizer.save_pretrained('trained_warp_model')
+    trained_model.save_pretrained("trained_warp_model")
+    tokenizer.save_pretrained("trained_warp_model")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 wandb:
   track: True
-  run_name: warp_save_model
+  run_name: warp_new_loggingV2
   project_name: WARP_imdb
   log_steps: 5
 
