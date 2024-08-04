@@ -36,7 +36,8 @@ def normalize(v: torch.Tensor, eps: float):
 
 
 def slerp(
-    t: float,
+    Lambda: float,
+    v_init: torch.Tensor,
     v0: torch.Tensor,
     v1: torch.Tensor,
     DOT_THRESHOLD: float = 0.9995,
@@ -47,11 +48,11 @@ def slerp(
 
     From: https://gist.github.com/dvschultz/3af50c40df002da3b751efab1daddf2c
     Args:
-        t: Float value between 0.0 and 1.0
-        v0: Starting layer weights
-        v1: Final layer weights
-        DOT_THRESHOLD (float): Threshold for considering the two vectors as
-                               colinear. Not recommended to alter this.
+        Lambda: Float value between 0.0 and 1.0
+        v_init: Initial weight of the model
+        v0: Task vector for the first model
+        v1: Task vector for the second model
+        DOT_THRESHOLD (float): Threshold for considering the two vectors as colinear.
     Returns:
         v2: Interpolation vector between v0 and v1
     """
@@ -68,26 +69,44 @@ def slerp(
 
     # If absolute value of dot product is almost 1, vectors are ~colinear, so use lerp
     if torch.abs(dot) > DOT_THRESHOLD:
-        res = lerp(t, v0_copy, v1_copy)
+        res = lerp(Lambda, v0_copy, v1_copy)
         return res
 
     # Calculate initial angle between v0 and v1
-    theta_0 = torch.arccos(dot)
-    sin_theta_0 = torch.sin(theta_0)
+    theta = torch.arccos(dot)
+    sin_theta = torch.sin(theta)
 
-    # Angle at timestep t
-    theta_t = theta_0 * t
-    sin_theta_t = torch.sin(theta_t)
+    theta_Lambda = theta * Lambda
+    sin_theta_Lambda = torch.sin(theta_Lambda)
 
-    # Finish the slerp algorithm
-    s0 = torch.sin(theta_0 - theta_t) / sin_theta_0
-    s1 = sin_theta_t / sin_theta_0
+    s0 = torch.sin(theta - theta_Lambda) / sin_theta
+    s1 = sin_theta_Lambda / sin_theta
     res = s0 * v0_copy + s1 * v1_copy
 
-    return res
+    return v_init + res
 
 
-def slerp_models(model1, model2, Lambda=0.5):
-    for param1, param2 in zip(model1.parameters(), model2.parameters()):
-        param1 = slerp(Lambda, param1, param2)
-    return model1
+def slerp_models(init_model, model1, model2, Lambda=0.5):
+    with torch.no_grad():
+        for init_param, param1, param2 in zip(
+            init_model.parameters(), model1.parameters(), model2.parameters()
+        ):
+            task_v1 = param1 - init_param
+            task_v2 = param2 - init_param
+            # менять параметры через присваивания не получается, поэтому вот такой костыль
+            init_param += slerp(Lambda, init_param, task_v1, task_v2) - init_param
+        return init_model
+
+# TEST
+if __name__ == "__main__":
+    init_model = torch.nn.Linear(10, 1)
+    with torch.no_grad():
+        init_model.weight = torch.nn.Parameter(torch.ones_like(init_model.weight))
+        model1 = torch.nn.Linear(10, 1)
+        model1.weight = torch.nn.Parameter(init_model.weight * 5)
+        model2 = torch.nn.Linear(10, 1)
+        model2.weight = torch.nn.Parameter(init_model.weight * 10)
+    print(init_model.weight)
+    init_model = slerp_models(init_model, model1, model2)
+    print(init_model.weight)
+    

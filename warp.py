@@ -10,6 +10,7 @@ import lovely_tensors as lt
 import torch.nn.functional as F
 from copy import deepcopy
 from merging import models_interpolate, slerp_models
+import wandb
 
 
 lt.monkey_patch()
@@ -20,7 +21,7 @@ generation_config = GenerationConfig(
     bos_token_id=50256,
     eos_token_id=50256,
     pad_token_id=50256,
-    max_length=512,
+    max_length=128,
     use_cache=True,  # сохранять KV для ускорения генерации
     # from ppov2_trainer.py source code
     temperature=TEMPERATURE,
@@ -67,11 +68,16 @@ def get_score(model, tokenizer, response_text):
     return logits
 
 
-def reward_KL_penalty(reward, beta, current_policy, anchor_policy):
+def get_kl(current_policy, anchor_policy):
     kl = current_policy - anchor_policy
     # mathematically correct reduction (https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html)
     kl = kl.sum(dim=-1) / current_policy.size(0)
     kl = kl.unsqueeze(-1)
+    return kl
+
+
+def reward_KL_penalty(reward, beta, current_policy, anchor_policy):
+    kl = get_kl(current_policy, anchor_policy)
     reward -= beta * kl
     return reward, kl
 
@@ -83,6 +89,7 @@ def model_generate_output(prompt, model, tokenizer):
         prompt,
         return_dict_in_generate=True,
         output_scores=True,
+        generation_config=generation_config,
     )
     generated = result["sequences"]
     scores = result["scores"]
@@ -123,16 +130,32 @@ def model_forward(
     )
 
 
-def policy_gradient(
-    reward_model,
+def get_policies(
     model,
     ref_model,
     tokenizer,
-    reward_model_tokenizer,
     prompt,  # B x L x |V| (B - batchsize, L - prompt len, |V| - vocab size)
-    optimizer,
-    beta,
 ):
+    """
+    Generate text and compute log probabilities for both the current model and a reference model.
+
+    This function performs the following steps:
+    1. Generates text using the current model based on the given prompt.
+    2. Computes logits and log probabilities for the generated text using both the current model and a reference model.
+
+    Args:
+        model: The current language model used for text generation.
+        ref_model: The reference language model used for comparison.
+        tokenizer: The tokenizer for the current model.
+        prompt (torch.Tensor): The input prompt tensor of shape (B, L, |V|), where B is the batch size,
+                               L is the prompt length, and |V| is the vocabulary size.
+
+    Returns:
+        tuple: A tuple containing:
+            - logprobs (torch.Tensor): Log probabilities of the generated tokens for the current model.
+            - anchor_logprobs (torch.Tensor): Log probabilities of the generated tokens for the reference model.
+            - full_text (str): The full generated text including the prompt.
+    """
     # ============= STEP 1 - GET POLICIES =============
     # get generation logits for the current model
     full_text_tokens, full_text, cur_logits = model_generate_output(
@@ -172,6 +195,22 @@ def policy_gradient(
     ).squeeze(-1)  # B x L_g
 
     # assert torch.equal(logprobs, anchor_logprobs)
+    return logprobs, anchor_logprobs, full_text
+
+
+def policy_gradient(
+    reward_model,
+    model,
+    ref_model,
+    tokenizer,
+    reward_model_tokenizer,
+    prompt,  # B x L x |V| (B - batchsize, L - prompt len, |V| - vocab size)
+    optimizer,
+    beta,
+):
+    logprobs, anchor_logprobs, full_text = get_policies(
+        model, ref_model, tokenizer, prompt
+    )
 
     # ============= STEP 2 - KL PENALIZED REWARD =============
     reward = get_score(reward_model, reward_model_tokenizer, full_text)
@@ -186,6 +225,26 @@ def policy_gradient(
     return reward, kl, loss
 
 
+def KL_reward_paretto_front(
+    model_sft, model_slerp, batch, tokenizer, reward_model, reward_model_tokenizer
+):
+    nus = [0, 0.1, 0.3, 0.5, 0.8, 1]
+    points = []
+    for nu in nus:
+        sft_copy = deepcopy(model_sft)
+        merged_model = models_interpolate(sft_copy, model_slerp, mu=nu)
+        merged_policy, sft_policy, response = get_policies(
+            merged_model,
+            model_sft,
+            tokenizer,
+            batch,
+        )
+        KL = get_kl(merged_policy, sft_policy).mean().item()
+        reward = get_score(reward_model, reward_model_tokenizer, response).mean().item()
+        points.append((reward, KL))
+    return points
+
+
 def warp(
     model_init,
     ref_model,
@@ -194,14 +253,18 @@ def warp(
     reward_model_tokenizer,
     X,
     opt,
-    I,
+    I,  # noqa: E741
     M,
     T,
     mu,
     nu,
     beta,
     batch_size,
+    log_steps=10,
 ):
+    train_rewards = []
+    train_kls = []
+
     for i in range(I):
         rl_runs = []
         for m in range(M):
@@ -213,35 +276,88 @@ def warp(
                 reward, kl, loss = policy_gradient(
                     reward_model,
                     model_m,
-                    ref_model,
+                    model_ema_m,
                     tokenizer,
                     reward_model_tokenizer,
                     prompt,
                     optimizer,
                     beta,
                 )
-                print("STEP:", t)
-                print(
-                    "REWARD:",
-                    reward.mean().item(),
-                    "|",
-                    "KL:",
-                    kl.mean().item(),
-                    "|",
-                    "LOSS:",
-                    loss.item(),
-                )
-                print("=" * 100)
+                train_rewards.append(reward.mean().item())
+                train_kls.append(kl.mean().item())
+                step = t + (T * m) + (M * T * i)
+                if step % log_steps == 0:
+                    info = {
+                        "step": step,
+                        "reward": reward.mean().item(),
+                        "kl": kl.mean().item(),
+                        "loss": loss.item(),
+                    }
+                    if WANDB_LOG:
+                        wandb.log(info)
+                    else:
+                        print(info)
                 model_ema_m = models_interpolate(model_ema_m, model_m, mu=mu)
             rl_runs.append(model_ema_m)
-        model_slerp = deepcopy(model_init)
-        for model in rl_runs:
-            model_slerp = slerp_models(model_slerp, model, Lambda=1 / M)
+        assert len(rl_runs) == 2, NotImplementedError
+        model_slerp = slerp_models(model_init, rl_runs[0], rl_runs[1], Lambda=1 / M)
         model_init = models_interpolate(model_init, model_slerp, mu=nu)
-    # return models_interpolate()
+
+    test_batch = get_random_prompts(X, batch_size)
+    points = KL_reward_paretto_front(
+        ref_model,
+        model_init,
+        test_batch,
+        tokenizer,
+        reward_model,
+        reward_model_tokenizer,
+    )
+
+    if WANDB_LOG:
+        wandb.log(
+            {
+                "KL_vs_Reward": wandb.plot.scatter(
+                    wandb.Table(
+                        data=[[kl, reward] for kl, reward in points],
+                        columns=["KL", "Reward"],
+                    ),
+                    "KL",
+                    "Reward",
+                    title="KL-Reward Pareto Front",
+                )
+            }
+        )
+
+        wandb.log(
+            {
+                "train KL_vs_Reward": wandb.plot.scatter(
+                    wandb.Table(
+                        data=[
+                            [kl, reward] for kl, reward in zip(train_kls, train_rewards)
+                        ],
+                        columns=["KL", "Reward"],
+                    ),
+                    "KL",
+                    "Reward",
+                    title="train KL-Reward",
+                )
+            }
+        )
+
+    wandb.finish()
+    return points
+
+
+WANDB_LOG = True
 
 
 def main():
+    if WANDB_LOG:
+        run = wandb.init(
+            project="WARP_imdb",
+            name="WARP_method_test",
+        )
+
     prompts = datasets.load_from_disk("prompts_dataset_tokenized")
     model_checkpoint = "lvwerra/gpt2-imdb"
     model = AutoModelForCausalLM.from_pretrained(model_checkpoint).to(device)
@@ -256,7 +372,7 @@ def main():
         reward_model_checkpoint, ignore_mismatched_sizes=True, num_labels=1
     ).to(device)
     reward_model_tokenizer = AutoTokenizer.from_pretrained(reward_model_checkpoint)
-    warp(
+    KL_reward_paretto_front = warp(
         model,
         ref_model,
         tokenizer,
@@ -264,14 +380,16 @@ def main():
         reward_model_tokenizer,
         prompts_ids,
         opt,
-        I=1,
+        I=2,
         M=2,
-        T=5000,
-        mu=0.001,
-        nu=0.3,
+        T=100,
+        mu=0.01,
+        nu=0.5,
         beta=0.1,
-        batch_size=16,
+        batch_size=64,
+        log_steps=5,
     )
+    print(KL_reward_paretto_front)
 
 
 if __name__ == "__main__":
