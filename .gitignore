@@ -1,6 +1,7 @@
 comment_pairs
-prompts_dataset_tokenized
+prompts_dataset*
 reward_model
 *wandb
 *__pycache__
 outputs
+trained*

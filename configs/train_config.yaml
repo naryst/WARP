@@ -1,8 +1,8 @@
 wandb:
-  track: False
-  run_name: warp_test
+  track: True
+  run_name: warp_save_model
   project_name: WARP_imdb
-  log_steps: 1
+  log_steps: 5
 
 model:
   generator_checkpoint: lvwerra/gpt2-imdb
@@ -28,7 +28,7 @@ generation_config:
   bos_token_id: 50256
   eos_token_id: 50256
   pad_token_id: 50256
-  max_length: 128
+  max_length: 64
   use_cache: true
   temperature: 0.7
   top_k: 0.0
