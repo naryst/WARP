@@ -1,0 +1,37 @@
+wandb:
+  track: False
+  run_name: warp_test
+  project_name: WARP_imdb
+  log_steps: 1
+
+model:
+  generator_checkpoint: lvwerra/gpt2-imdb
+  reward_model_checkpoint: reward_model/final_checkpoint
+
+data:
+  data_path: prompts_dataset_tokenized
+
+training:
+  device: "cuda"
+  lr: 1e-4
+  batch_size: 64
+
+warp:
+  I: 2
+  M: 2
+  T: 100
+  mu: 0.01
+  nu: 0.5
+  beta: 0.1
+
+generation_config:
+  bos_token_id: 50256
+  eos_token_id: 50256
+  pad_token_id: 50256
+  max_length: 128
+  use_cache: true
+  temperature: 0.7
+  top_k: 0.0
+  top_p: 1.0
+  do_sample: true
+  return_tensors: "pt"

@@ -18,10 +18,13 @@ def sum_model_weights(model1, model2):
     return scaled_model
 
 
-def models_interpolate(model, additional_model, mu):
-    scaled_model = scale_model_weights(model, mu)
-    scaled_model_ema = scale_model_weights(additional_model, (1 - mu))
-    return sum_model_weights(scaled_model, scaled_model_ema)
+def models_interpolate(model_first, model_second, mu):
+    """
+    Returns: model_first * mu + model_second * (1 - mu)
+    """
+    scaled_model_first = scale_model_weights(model_first, mu)
+    scaled_model_second = scale_model_weights(model_second, (1 - mu))
+    return sum_model_weights(scaled_model_first, scaled_model_second)
 
 
 def lerp(t: float, v0: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:

@@ -11,30 +11,9 @@ import torch.nn.functional as F
 from copy import deepcopy
 from merging import models_interpolate, slerp_models
 import wandb
-
+import hydra
 
 lt.monkey_patch()
-TEMPERATURE = 0.7
-device = torch.device("cuda")
-
-generation_config = GenerationConfig(
-    bos_token_id=50256,
-    eos_token_id=50256,
-    pad_token_id=50256,
-    max_length=128,
-    use_cache=True,  # сохранять KV для ускорения генерации
-    # from ppov2_trainer.py source code
-    temperature=TEMPERATURE,
-    top_k=0.0,
-    top_p=1.0,
-    do_sample=True,
-    return_tensors="pt",
-)
-tokenizer_config = {
-    "padding": "max_length",
-    "truncation": True,
-    "return_tensors": "pt",
-}
 
 
 def weights_check(model1, model2):
@@ -51,7 +30,7 @@ def weights_check(model1, model2):
 
 
 # create Adam optimizer with a given model params
-def opt(model, lr=1e-6):
+def opt(model, lr=1e-4):
     return torch.optim.AdamW(model.parameters(), lr=lr)
 
 
@@ -61,7 +40,9 @@ def get_random_prompts(dataset, batch_size):
 
 
 def get_score(model, tokenizer, response_text):
-    inputs = tokenizer(response_text, **tokenizer_config).to(model.device)
+    inputs = tokenizer(
+        response_text, padding="max_length", truncation=True, return_tensors="pt"
+    ).to(model.device)
     with torch.no_grad():
         outputs = model(**inputs)
     logits = outputs.logits
@@ -232,7 +213,7 @@ def KL_reward_paretto_front(
     points = []
     for nu in nus:
         sft_copy = deepcopy(model_sft)
-        merged_model = models_interpolate(sft_copy, model_slerp, mu=nu)
+        merged_model = models_interpolate(model_slerp, sft_copy, mu=nu)
         merged_policy, sft_policy, response = get_policies(
             merged_model,
             model_sft,
@@ -246,33 +227,19 @@ def KL_reward_paretto_front(
 
 
 def warp(
-    model_init,
-    ref_model,
-    tokenizer,
-    reward_model,
-    reward_model_tokenizer,
-    X,
-    opt,
-    I,  # noqa: E741
-    M,
-    T,
-    mu,
-    nu,
-    beta,
-    batch_size,
-    log_steps=10,
+    model_init, ref_model, tokenizer, reward_model, reward_model_tokenizer, X, opt, cfg
 ):
     train_rewards = []
     train_kls = []
 
-    for i in range(I):
+    for i in range(cfg.warp.I):
         rl_runs = []
-        for m in range(M):
+        for m in range(cfg.warp.M):
             model_m = deepcopy(model_init)
             model_ema_m = deepcopy(model_init)
-            for t in range(T):
-                optimizer = opt(model_m)
-                prompt = get_random_prompts(X, batch_size)
+            for t in range(cfg.warp.T):
+                optimizer = opt(model_m, lr=cfg.training.lr)
+                prompt = get_random_prompts(X, cfg.training.batch_size)
                 reward, kl, loss = policy_gradient(
                     reward_model,
                     model_m,
@@ -281,29 +248,31 @@ def warp(
                     reward_model_tokenizer,
                     prompt,
                     optimizer,
-                    beta,
+                    cfg.warp.beta,
                 )
                 train_rewards.append(reward.mean().item())
                 train_kls.append(kl.mean().item())
-                step = t + (T * m) + (M * T * i)
-                if step % log_steps == 0:
+                step = t + (cfg.warp.T * m) + (cfg.warp.M * cfg.warp.T * i)
+                if step % cfg.wandb.log_steps == 0:
                     info = {
                         "step": step,
                         "reward": reward.mean().item(),
                         "kl": kl.mean().item(),
                         "loss": loss.item(),
                     }
-                    if WANDB_LOG:
+                    if cfg.wandb.track:
                         wandb.log(info)
                     else:
                         print(info)
-                model_ema_m = models_interpolate(model_ema_m, model_m, mu=mu)
+                model_ema_m = models_interpolate(model_m, model_ema_m, mu=cfg.warp.mu)
             rl_runs.append(model_ema_m)
         assert len(rl_runs) == 2, NotImplementedError
-        model_slerp = slerp_models(model_init, rl_runs[0], rl_runs[1], Lambda=1 / M)
-        model_init = models_interpolate(model_init, model_slerp, mu=nu)
+        model_slerp = slerp_models(
+            model_init, rl_runs[0], rl_runs[1], Lambda=1 / cfg.warp.M
+        )
+        model_init = models_interpolate(model_slerp, model_init, mu=cfg.warp.nu)
 
-    test_batch = get_random_prompts(X, batch_size)
+    test_batch = get_random_prompts(X, cfg.training.batch_size)
     points = KL_reward_paretto_front(
         ref_model,
         model_init,
@@ -351,15 +320,21 @@ def warp(
 WANDB_LOG = True
 
 
-def main():
-    if WANDB_LOG:
+@hydra.main(version_base=None, config_path="configs", config_name="config")
+def main(cfg):
+    global TEMPERATURE, device, generation_config
+    TEMPERATURE = cfg.generation_config.temperature
+    device = torch.device(cfg.training.device)
+
+    if cfg.wandb.track:
         run = wandb.init(
-            project="WARP_imdb",
+            project=cfg.wandb.project_name,
             name="WARP_method_test",
         )
+    generation_config = GenerationConfig(**cfg.generation_config)
 
-    prompts = datasets.load_from_disk("prompts_dataset_tokenized")
-    model_checkpoint = "lvwerra/gpt2-imdb"
+    prompts = datasets.load_from_disk(cfg.data.data_path)
+    model_checkpoint = cfg.model.generator_checkpoint
     model = AutoModelForCausalLM.from_pretrained(model_checkpoint).to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
     tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -367,7 +342,7 @@ def main():
     ref_model = AutoModelForCausalLM.from_pretrained(model_checkpoint).to(device)
     prompts_ids = prompts["prompt_input_ids"].to(device)
 
-    reward_model_checkpoint = "reward_model/final_checkpoint"
+    reward_model_checkpoint = cfg.model.reward_model_checkpoint
     reward_model = AutoModelForSequenceClassification.from_pretrained(
         reward_model_checkpoint, ignore_mismatched_sizes=True, num_labels=1
     ).to(device)
@@ -380,14 +355,7 @@ def main():
         reward_model_tokenizer,
         prompts_ids,
         opt,
-        I=2,
-        M=2,
-        T=100,
-        mu=0.01,
-        nu=0.5,
-        beta=0.1,
-        batch_size=64,
-        log_steps=5,
+        cfg,
     )
     print(KL_reward_paretto_front)
 
