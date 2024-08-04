@@ -1,21 +1,24 @@
 wandb:
   track: True
-  run_name: warp_new_loggingV2
+  run_name: warp_lr=1e-5_mu=0.01
   project_name: WARP_imdb
   log_steps: 5
 
 model:
   generator_checkpoint: lvwerra/gpt2-imdb
   reward_model_checkpoint: reward_model/final_checkpoint
+  save_path: trained_warp_model_lr=1e-5_v2_mu=0.01
 
 data:
   data_path: prompts_dataset_tokenized
+  test_data_path: prompts_dataset_tokenized_test
 
 training:
   device: "cuda"
-  lr: 1e-4
+  lr: 1e-5
   batch_size: 64
   seed: 42
+  device_id: 0
 
 warp:
   I: 2

@@ -17,10 +17,6 @@ from omegaconf import OmegaConf
 lt.monkey_patch()
 
 
-def set_random_seed(state):
-    torch.manual_seed(state)
-
-
 def weights_check(model1, model2):
     main_model_weights = {k: v.clone() for k, v in model1.named_parameters()}
     reference_model_weights = {k: v.clone() for k, v in model2.named_parameters()}
@@ -252,7 +248,7 @@ def step_log(step, reward, kl, loss, track):
 def final_log(points, train_kls, train_rewards):
     wandb.log(
         {
-            "KL_vs_Reward": wandb.plot.scatter(
+            "KL_vs_Reward": wandb.plot.line(
                 wandb.Table(
                     data=[[kl, reward] for kl, reward in points],
                     columns=["KL", "Reward"],
@@ -263,9 +259,10 @@ def final_log(points, train_kls, train_rewards):
             )
         }
     )
+
     wandb.log(
         {
-            "train KL_vs_Reward": wandb.plot.scatter(
+            "train KL_vs_Reward": wandb.plot.line(
                 wandb.Table(
                     data=[
                         [kl, reward] for kl, reward in zip(train_kls, train_rewards)
@@ -278,6 +275,7 @@ def final_log(points, train_kls, train_rewards):
             )
         }
     )
+
 
 
 def warp(
@@ -349,10 +347,11 @@ def warp(
     return points, model_init
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="train_config")
+@hydra.main(version_base=None, config_path="../configs", config_name="train_config")
 def main(cfg):
     device = torch.device(cfg.training.device)
-    set_random_seed(cfg.training.seed)
+    if device == torch.device('cuda'):
+        device = torch.device(f"cuda:{cfg.training.device_id}")
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     if cfg.wandb.track:
         run = wandb.init(  # noqa: F841
@@ -384,9 +383,8 @@ def main(cfg):
         opt,
         cfg,
     )
-    print(KL_reward_paretto_front)
-    trained_model.save_pretrained("trained_warp_model")
-    tokenizer.save_pretrained("trained_warp_model")
+    trained_model.save_pretrained(cfg.model.save_path)
+    tokenizer.save_pretrained(cfg.model.save_path)
 
 
 if __name__ == "__main__":

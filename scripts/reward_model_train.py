@@ -16,6 +16,15 @@ data = datasets.load_from_disk("comment_pairs")
 
 
 def tokenize_data(sample):
+    """
+    # Reward trainer Должен иметь следующие фичи на входе 
+    * `input_ids_chosen`
+    * `attention_mask_chosen`
+    * `input_ids_rejected` 
+    * `attention_mask_rejected`
+
+    **Chosen** в нашем случае - позитивный комментарий, **Rejected** - негативный
+    """
     tokenized_pos = tokenizer(
         sample["positive_comment"],
         padding="max_length",
