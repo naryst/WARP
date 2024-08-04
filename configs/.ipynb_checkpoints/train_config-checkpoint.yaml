@@ -1,5 +1,5 @@
 wandb:
-  track: True
+  track: False
   run_name: warp_lr=1e-5_mu=0.01
   project_name: WARP_imdb
   log_steps: 5

@@ -1,6 +1,6 @@
 wandb:
   track: False
-  run_name: warp_lr=1e-5_mu=0.01
+  run_name: eval_warp_lr=1e-5_mu=0.1
   project_name: WARP_imdb
   log_steps: 5
 
@@ -15,10 +15,10 @@ data:
 
 training:
   device: "cuda"
-  lr: 1e-5
+  lr: 1e-4
   batch_size: 64
   seed: 42
-  device_id: 0
+  device_id: 2
 
 warp:
   I: 2

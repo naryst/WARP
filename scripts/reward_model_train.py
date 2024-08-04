@@ -12,7 +12,7 @@ model = AutoModelForSequenceClassification.from_pretrained("distilbert/distilber
 
 #поменять классифаер на предсказание скаляра (в этом случае - reward)
 model.classifier = torch.nn.Linear(model.pre_classifier.weight.size(1), 1)
-data = datasets.load_from_disk("comment_pairs")
+data = datasets.load_from_disk("../comment_pairs")
 
 
 def tokenize_data(sample):
@@ -77,4 +77,4 @@ trainer = RewardTrainer(
 
 # Train the model
 trainer.train()
-trainer.save_model('reward_model/final_checkpoint')
+trainer.save_model('../reward_model/final_checkpoint')
