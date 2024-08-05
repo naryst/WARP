@@ -123,7 +123,8 @@ generation_config:
 
 Это шаг обновления экспоненциального скользящего среднего (EMA), где $\mu$ управляет скоростью обновления EMA anchor $\theta^{m}_{EMA}$ на основе текущих весов $\theta^m$.
 
-То есть при увеличении $\mu$, $\theta^{m}_{EMA}$ будет больше похож на $\theta^m$. А так как, в идее алгоритма reward регулируется с помощью $\frac{\pi_{\theta^m}}{\pi_{\theta^m_{EMA}}}$, то приближение этих двух policy уменьшит штраф для $r_\beta$, соответственно позволяя делать алгоритму более агрессивные шаги в policy gradient. 
+То есть при увеличении $\mu$, $\theta_{EMA}^{m}$ будет больше похож на $\theta^m$ А так как, в идее алгоритма reward регулируется с помощью $\frac{\pi_{\theta^m}}{\pi_{\theta^m_{EMA}}}$, то приближение этих двух policy уменьшит штраф для $r_\beta$, соответственно позволяя делать алгоритму более агрессивные шаги в policy gradient. 
+
 То есть, увеличение этого параметра уменьшает регуляризацию примерно таким же образом, как увеличение $\beta$. К примерно такому же выводу пришли авторы оригинальной статьи:
 
 ![mu impact](pics/mu_impact.png)
@@ -145,3 +146,48 @@ KL-reward Pareto Front также показывает похожую тенде
 
 
 ## Приложение
+
+### Интструкции по воспроизведению экспериментов:
+Для подготовки enviroment'a:
+```shell
+conda env create --file environment.yaml
+```
+
+Далее для запуска полного пайплайна:
+
+**Создать датасет из пар (positive|negative):**
+```shell
+python scripts/prepare_data_reward.py --split train
+```
+
+**Обучить reward модель:**
+```shell
+python scripts/reward_model_train.py 
+```
+
+**Создать датасет промптов:**
+```shell
+python scripts/prepare_prompts_dataset.py --split train
+```
+
+**Обучить модель с помощью метода WARP:**
+```shell
+python scripts/warp.py
+```
+Параметры для обучения настроиваются через конифг в `configs/train_config.yaml`
+
+
+**Подготовить датасет промптов для тестовой выборки для evaluation'а:**
+```shell
+python scripts/prepare_prompts_dataset.py --split test
+```
+
+**Собрать reward и KL на тестовых данных для обученной модели и изначальной:**
+```shell
+python python scripts/model_eval.py
+``` 
+Параметры для eval'а настраиваются через `configs/eval_config.yaml`
+
+### Дополнительные ссылки:
+* [Проект на wandb](https://wandb.ai/nikitasergeev692/WARP_imdb?nw=nwusernikitasergeev692)
+* Репорт по  

@@ -5,3 +5,4 @@ reward_model
 *__pycache__
 outputs
 trained*
+*.ipynb_checkpoints
