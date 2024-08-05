@@ -21,7 +21,7 @@ def prepare_data(split):
         }
     )
 
-    pairs_dataset.save_to_disk("../comment_pairs")
+    pairs_dataset.save_to_disk("comment_pairs")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare IMDb data.")

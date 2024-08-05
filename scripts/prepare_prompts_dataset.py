@@ -34,7 +34,7 @@ def main(split):
         fn_kwargs={"prompt_tokens_count": prompt_tokens_count},
     )
     data.set_format("torch")
-    data.save_to_disk("../prompts_dataset_tokenized_test")
+    data.save_to_disk(f"prompts_dataset_tokenized_{split}")
 
 
 if __name__ == "__main__":

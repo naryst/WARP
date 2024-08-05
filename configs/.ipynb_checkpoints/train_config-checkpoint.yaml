@@ -1,5 +1,5 @@
 wandb:
-  track: False
+  track: True
   run_name: warp_lr=1e-5_mu=0.01
   project_name: WARP_imdb
   log_steps: 5
@@ -10,7 +10,7 @@ model:
   save_path: trained_warp_model_lr=1e-5_mu=0.01
 
 data:
-  data_path: prompts_dataset_tokenized
+  data_path: prompts_dataset_tokenized_train
   test_data_path: prompts_dataset_tokenized_test
 
 training:
