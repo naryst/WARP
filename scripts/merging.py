@@ -27,6 +27,9 @@ def models_interpolate(model_first, model_second, mu):
     return sum_model_weights(scaled_model_first, scaled_model_second)
 
 
+# Приемущественно взято из 
+# https://github.com/arcee-ai/mergekit/blob/main/mergekit/merge_methods/slerp.py
+# Но адаптировано под использование Task vector'ов вместо весов модели
 def lerp(t: float, v0: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:
     return (1 - t) * v0 + t * v1
 
@@ -94,6 +97,7 @@ def slerp_models(init_model, model1, model2, Lambda=0.5):
         for init_param, param1, param2 in zip(
             init_model.parameters(), model1.parameters(), model2.parameters()
         ):
+            # task vectors  for the initial model
             task_v1 = param1 - init_param
             task_v2 = param2 - init_param
             # менять параметры через присваивания не получается, поэтому вот такой костыль

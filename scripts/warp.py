@@ -192,6 +192,7 @@ def policy_gradient(
     optimizer,
     beta,
     generation_config,
+    make_optimizer_step=True,
 ):
     logprobs, anchor_logprobs, full_text = get_policies(
         model, ref_model, tokenizer, prompt, generation_config
@@ -211,22 +212,27 @@ def policy_gradient(
 
 
 def KL_reward_paretto_front(
-    model_sft,
-    model_slerp,
-    batch,
-    tokenizer,
-    reward_model,
-    reward_model_tokenizer,
-    generation_config,
+    model_sft,  # Pre-trained model (student fine-tuned)
+    model_slerp,  # Pre-trained model for slerp interpolation
+    batch,  # Batch of input data
+    tokenizer,  # Tokenizer for the models
+    reward_model,  # Model used for computing reward score
+    reward_model_tokenizer,  # Tokenizer for the reward model
+    generation_config,  # Configuration for text generation
 ):
+    # List of interpolation coefficients
     nus = [0, 0.1, 0.3, 0.5, 0.8, 1]
     points = []
     for nu in nus:
         sft_copy = deepcopy(model_sft)
+        # Interpolate between the model_slerp and the deep copy of model_sft
         merged_model = models_interpolate(model_slerp, sft_copy, mu=nu)
+
+        # Generate policies
         merged_policy, sft_policy, response = get_policies(
             merged_model, model_sft, tokenizer, batch, generation_config
         )
+
         KL = get_kl(merged_policy, sft_policy).mean().item()
         reward = get_score(reward_model, reward_model_tokenizer, response).mean().item()
         points.append((KL, reward))
@@ -244,6 +250,7 @@ def step_log(step, reward, kl, loss, track):
         wandb.log(info, step=step)
     else:
         print(info)
+
 
 def final_log(points, train_kls, train_rewards):
     wandb.log(
@@ -264,9 +271,7 @@ def final_log(points, train_kls, train_rewards):
         {
             "train KL_vs_Reward": wandb.plot.line(
                 wandb.Table(
-                    data=[
-                        [kl, reward] for kl, reward in zip(train_kls, train_rewards)
-                    ],
+                    data=[[kl, reward] for kl, reward in zip(train_kls, train_rewards)],
                     columns=["KL", "Reward"],
                 ),
                 "KL",
@@ -277,21 +282,32 @@ def final_log(points, train_kls, train_rewards):
     )
 
 
-
 def warp(
-    model_init, ref_model, tokenizer, reward_model, reward_model_tokenizer, X, opt, cfg
+    model_init,  # Initial model to be optimized
+    ref_model,  # Reference model for computing reward and KL divergence
+    tokenizer,  # Tokenizer for the models
+    reward_model,  # Model used for computing reward score
+    reward_model_tokenizer,  # Tokenizer for the reward model
+    X,  # Dataset for training
+    opt,  # Optimizer function
+    cfg,  # Configuration object containing various hyperparameters and settings
 ):
     train_rewards = []
     train_kls = []
     generation_config = GenerationConfig(**cfg.generation_config)
+
+    # Main loop for the number of WARP iterations
     for i in range(cfg.warp.I):
         rl_runs = []
         for m in range(cfg.warp.M):
             model_m = deepcopy(model_init)
             model_ema_m = deepcopy(model_init)
+            optimizer = opt(model_m, lr=cfg.training.lr)
+
             for t in range(cfg.warp.T):
-                optimizer = opt(model_m, lr=cfg.training.lr)
                 prompt = get_random_prompts(X, cfg.training.batch_size)
+
+                # Perform a policy gradient update and get reward, KL divergence, and loss
                 reward, kl, loss = policy_gradient(
                     reward_model,
                     model_m,
@@ -303,9 +319,13 @@ def warp(
                     cfg.warp.beta,
                     generation_config,
                 )
-                step = t + (cfg.warp.T * m) + (cfg.warp.M * cfg.warp.T * i)
+
+                step = (
+                    t + (cfg.warp.T * m) + (cfg.warp.M * cfg.warp.T * i)
+                )  # Calculate the current step
+
                 if step % cfg.wandb.log_steps == 0:
-                    # заново посчитать reward и  KL c базовой версией модели (а не EMA)
+                    # Recalculate reward and KL with the reference model instead of EMA model
                     point_reward, point_kl, point_loss = policy_gradient(
                         reward_model,
                         model_m,
@@ -316,20 +336,31 @@ def warp(
                         optimizer,
                         cfg.warp.beta,
                         generation_config,
+                        make_optimizer_step=False,  # policies just for metrics, don't optimize
                     )
                     step_log(step, point_reward, point_kl, point_loss, cfg.wandb.track)
+
                     train_rewards.append(point_reward.mean().item())
                     train_kls.append(point_kl.mean().item())
 
+                # Update the EMA model by interpolating with the current model
                 model_ema_m = models_interpolate(model_m, model_ema_m, mu=cfg.warp.mu)
+
+            # Store the final EMA model for the current run
             rl_runs.append(model_ema_m)
+
         assert len(rl_runs) == 2, NotImplementedError
+
+        # Perform spherical linear interpolation (slerp) between the initial model and the two EMA models
         model_slerp = slerp_models(
             model_init, rl_runs[0], rl_runs[1], Lambda=1 / cfg.warp.M
         )
+
+        # Update the initial model by interpolating with the slerp model
         model_init = models_interpolate(model_slerp, model_init, mu=cfg.warp.nu)
 
     test_batch = get_random_prompts(X, cfg.training.batch_size)
+    # Compute the Pareto front of KL divergence and reward
     points = KL_reward_paretto_front(
         ref_model,
         model_init,
@@ -344,13 +375,14 @@ def warp(
         final_log(points, train_kls, train_rewards)
 
     wandb.finish()
+
     return points, model_init
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train_config")
 def main(cfg):
     device = torch.device(cfg.training.device)
-    if device == torch.device('cuda'):
+    if device == torch.device("cuda"):
         device = torch.device(f"cuda:{cfg.training.device_id}")
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     if cfg.wandb.track:
