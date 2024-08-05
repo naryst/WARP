@@ -106,6 +106,7 @@ generation_config:
 
 ![kl_eval](pics/kl_eval.png)
 ![reward_eval](pics/reward_eval.png)
+![kl_reward_stat](pics/KL_reward_stats.png)
 
 Как видно, средний reward у модели с большим learning rate'ом выше. Однако ее KL относительно начальной модели также значительно выше, чем у варианта со меньшим learning rate'ом. 
 
@@ -190,4 +191,4 @@ python python scripts/model_eval.py
 
 ### Дополнительные ссылки:
 * [Проект на wandb](https://wandb.ai/nikitasergeev692/WARP_imdb?nw=nwusernikitasergeev692)
-* Репорт по  
+* [Репорт с основными результатами полученными в ходе проведения экспериментов](https://api.wandb.ai/links/nikitasergeev692/xpk1hpi9)
